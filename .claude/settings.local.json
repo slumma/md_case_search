@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.mdcourts.gov)",
+      "Bash(curl -sI \"https://www.mdcourts.gov/data/case/file2026-03-28.pdf\" -A \"Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36\")",
+      "Bash(sudo pacman:*)",
+      "Bash(pip install:*)",
+      "Bash(pdftotext -layout sample.pdf -)",
+      "Bash(grep -v \"^--$\")",
+      "Bash(python3 -c \"import urllib.request, csv, subprocess, re; print\\(''stdlib ok''\\)\")",
+      "Bash(cp /home/sam/GitHub/sample.pdf output/cases-2026-03-28.pdf)",
+      "Bash(python3 scraper.py 2026-03-28)",
+      "Bash(python3 -c \":*)",
+      "Bash(python3 -c \"import pandas; print\\(pandas.__version__\\)\")",
+      "Bash(python3 -c \"import jupyter; print\\(''jupyter ok''\\)\")",
+      "Bash(python3 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -m ensurepip --upgrade)",
+      "Bash(python3 -m pip install pandas matplotlib notebook --quiet)",
+      "Bash(echo 'none found' ls /usr/lib/python3*/site-packages/)",
+      "Bash(curl -LsSf https://astral.sh/uv/install.sh)",
+      "Bash(sh)",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(uv pip:*)",
+      "Bash(uv venv:*)",
+      "Bash(.venv/bin/python -c \"import pandas, matplotlib, notebook; print\\(''all ok''\\)\")",
+      "Bash(.venv/bin/jupyter nbconvert:*)"
+    ]
+  }
+}
