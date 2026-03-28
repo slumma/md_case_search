@@ -48,6 +48,72 @@ CITY_STATE_ZIP_RE = re.compile(
 # Charge line:  1 - SOME CHARGE TEXT
 CHARGE_RE = re.compile(r"^\d+\s+-\s+(.+)$")
 
+# ---------------------------------------------------------------------------
+# Court location → county mapping
+# ---------------------------------------------------------------------------
+
+COURT_TO_COUNTY = {
+    "Allegany": "Allegany County",
+    "Allegany Circuit Court": "Allegany County",
+    "Annapolis": "Anne Arundel County",
+    "Anne Arundel Circuit Court": "Anne Arundel County",
+    "Appellate Court of Maryland": "Anne Arundel County",
+    "Supreme Court of Maryland": "Anne Arundel County",
+    "Baltimore City Circuit Court": "Baltimore City",
+    "Eastside": "Baltimore City",
+    "Fayette": "Baltimore City",
+    "Hargrove": "Baltimore City",
+    "Wabash": "Baltimore City",
+    "Baltimore County Circuit Court": "Baltimore County",
+    "Catonsville": "Baltimore County",
+    "Essex": "Baltimore County",
+    "Towson": "Baltimore County",
+    "Calvert": "Calvert County",
+    "Calvert Circuit Court": "Calvert County",
+    "Caroline": "Caroline County",
+    "Caroline Circuit Court": "Caroline County",
+    "Carroll": "Carroll County",
+    "Carroll Circuit Court": "Carroll County",
+    "Cecil": "Cecil County",
+    "Cecil Circuit Court": "Cecil County",
+    "Charles": "Charles County",
+    "Charles Circuit Court": "Charles County",
+    "Dorchester": "Dorchester County",
+    "Dorchester Circuit Court": "Dorchester County",
+    "Frederick": "Frederick County",
+    "Frederick Circuit Court": "Frederick County",
+    "Garrett": "Garrett County",
+    "Garrett Circuit Court": "Garrett County",
+    "Glen Burnie": "Anne Arundel County",
+    "Harford": "Harford County",
+    "Harford Circuit Court": "Harford County",
+    "Howard": "Howard County",
+    "Howard Circuit Court": "Howard County",
+    "Hyattsville": "Prince George's County",
+    "Upper Marlboro": "Prince George's County",
+    "Prince Georges Circuit Court": "Prince George's County",
+    "Kent": "Kent County",
+    "Kent Circuit Court": "Kent County",
+    "Rockville": "Montgomery County",
+    "Silver Spring": "Montgomery County",
+    "Montgomery Circuit Court": "Montgomery County",
+    "Ocean City": "Worcester County",
+    "Snow Hill": "Worcester County",
+    "Worcester Circuit Court": "Worcester County",
+    "Queen Annes": "Queen Anne's County",
+    "Queen Annes Circuit Court": "Queen Anne's County",
+    "Saint Marys": "Saint Mary's County",
+    "Saint Marys Circuit Court": "Saint Mary's County",
+    "Somerset": "Somerset County",
+    "Somerset Circuit Court": "Somerset County",
+    "Talbot": "Talbot County",
+    "Talbot Circuit Court": "Talbot County",
+    "Washington": "Washington County",
+    "Washington Circuit Court": "Washington County",
+    "Wicomico": "Wicomico County",
+    "Wicomico Circuit Court": "Wicomico County",
+}
+
 # Lines to always skip
 SKIP_PATTERNS = [
     "AOC - Cases Filed Report",
@@ -316,12 +382,13 @@ def parse_cases(text: str) -> list[dict]:
             last_name, first_name = parse_name(name)
             current_case = {
                 "case_number": case_number,
-                "defendant_name": name,
+                "defendant_name": name.title(),
                 "last_name": last_name,
                 "first_name": first_name,
                 "case_type": case_type,
                 "file_date": file_date,
-                "county": current_county,
+                "court_location": current_county,
+                "county": COURT_TO_COUNTY.get(current_county, ""),
                 "address_street": "",
                 "address_city": "",
                 "address_state": "",
@@ -352,6 +419,7 @@ CSV_FIELDS = [
     "case_number",
     "file_date",
     "county",
+    "court_location",
     "last_name",
     "first_name",
     "defendant_name",
@@ -420,8 +488,17 @@ def main():
     records = parse_cases(text)
     print(f"Parsed {len(records):,} cases", file=sys.stderr)
 
-    # Export
+    # Export to CSV (archival backup)
     records_to_csv(records, csv_path)
+
+    # Upsert into DuckDB
+    import db as _db
+    conn = _db.get_conn()
+    _db.init_db(conn)
+    _db.upsert_records(conn, records)
+    conn.close()
+    print(f"Upserted {len(records):,} records into {_db.DB_PATH}", file=sys.stderr)
+
     print(f"Done: {csv_path}")
 
 
