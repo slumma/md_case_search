@@ -26,23 +26,46 @@ def get_conn(read_only: bool = False) -> duckdb.DuckDBPyConnection:
 def init_db(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cases (
-            case_number     TEXT    NOT NULL,
-            file_date       DATE    NOT NULL,
-            county          TEXT    NOT NULL DEFAULT '',
-            court_location  TEXT    NOT NULL DEFAULT '',
-            last_name       TEXT    NOT NULL DEFAULT '',
-            first_name      TEXT    NOT NULL DEFAULT '',
-            defendant_name  TEXT    NOT NULL DEFAULT '',
-            case_type       TEXT    NOT NULL DEFAULT '',
-            address_street  TEXT    NOT NULL DEFAULT '',
-            address_city    TEXT    NOT NULL DEFAULT '',
-            address_state   TEXT    NOT NULL DEFAULT '',
-            address_zip     TEXT    NOT NULL DEFAULT '',
-            charges_flat    TEXT    NOT NULL DEFAULT '',
-            scraped_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            case_number           TEXT    NOT NULL,
+            file_date             DATE    NOT NULL,
+            county                TEXT    NOT NULL DEFAULT '',
+            court_location        TEXT    NOT NULL DEFAULT '',
+            last_name             TEXT    NOT NULL DEFAULT '',
+            first_name            TEXT    NOT NULL DEFAULT '',
+            defendant_name        TEXT    NOT NULL DEFAULT '',
+            case_type             TEXT    NOT NULL DEFAULT '',
+            address_street        TEXT    NOT NULL DEFAULT '',
+            address_city          TEXT    NOT NULL DEFAULT '',
+            address_state         TEXT    NOT NULL DEFAULT '',
+            address_zip           TEXT    NOT NULL DEFAULT '',
+            charges_flat          TEXT    NOT NULL DEFAULT '',
+            scraped_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+            -- Address validation columns (populated by validate_addresses.py)
+            addr_validated        BOOLEAN DEFAULT FALSE,
+            addr_verdict          TEXT    DEFAULT '',
+            addr_corrected_street TEXT    DEFAULT '',
+            addr_corrected_city   TEXT    DEFAULT '',
+            addr_corrected_state  TEXT    DEFAULT '',
+            addr_corrected_zip    TEXT    DEFAULT '',
+            addr_validated_at     TIMESTAMPTZ DEFAULT NULL,
             PRIMARY KEY (case_number, file_date)
         )
     """)
+
+    # Add validation columns to existing DBs that predate this schema change
+    for col, typedef in [
+        ("addr_validated",        "BOOLEAN DEFAULT FALSE"),
+        ("addr_verdict",          "TEXT DEFAULT ''"),
+        ("addr_corrected_street", "TEXT DEFAULT ''"),
+        ("addr_corrected_city",   "TEXT DEFAULT ''"),
+        ("addr_corrected_state",  "TEXT DEFAULT ''"),
+        ("addr_corrected_zip",    "TEXT DEFAULT ''"),
+        ("addr_validated_at",     "TIMESTAMPTZ DEFAULT NULL"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE cases ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass  # column already exists
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS case_charges (
@@ -191,7 +214,12 @@ def query_date(conn: duckdb.DuckDBPyConnection, file_date: str) -> pd.DataFrame:
             address_city,
             address_state,
             address_zip,
-            charges_flat AS charges
+            charges_flat AS charges,
+            COALESCE(addr_verdict, '')          AS addr_verdict,
+            COALESCE(addr_corrected_street, '') AS addr_corrected_street,
+            COALESCE(addr_corrected_city, '')   AS addr_corrected_city,
+            COALESCE(addr_corrected_state, '')  AS addr_corrected_state,
+            COALESCE(addr_corrected_zip, '')    AS addr_corrected_zip
         FROM cases
         WHERE strftime(file_date, '%Y-%m-%d') = ?
         ORDER BY county, last_name, first_name
