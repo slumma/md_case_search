@@ -20,13 +20,13 @@ echo "--- scraper ---" >> "$LOG"
   echo "Scraper FAILED (exit $?)" >> "$LOG"
 
 # 2. Validate new addresses (skip if no API key set)
-if [ -f "$DIR/.env" ] && grep -q "GOOGLE_API_KEY=." "$DIR/.env"; then
+if [ -f "$DIR/.env" ] && grep -q "USPS_USER_ID=." "$DIR/.env"; then
   echo "--- address validation ---" >> "$LOG"
   "$PYTHON" "$DIR/validate_addresses.py" >> "$LOG" 2>&1 && \
     echo "Validation OK" >> "$LOG" || \
     echo "Validation FAILED (exit $?)" >> "$LOG"
 else
-  echo "--- address validation skipped (no GOOGLE_API_KEY) ---" >> "$LOG"
+  echo "--- address validation skipped (no USPS_USER_ID in .env) ---" >> "$LOG"
 fi
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') — daily run complete" >> "$LOG"

@@ -4,25 +4,46 @@ MD Case Search Scraper
 Downloads the daily public cases PDF from mdcourts.gov and parses it into CSV.
 
 Usage:
-    python3 scraper.py                   # today's report (yesterday's cases)
-    python3 scraper.py 2026-03-28        # specific date
+    python3 scraper.py                     # today's report (yesterday's cases)
+    python3 scraper.py 2026-03-28          # specific date
+    python3 scraper.py --backfill 30       # fetch last 30 days
     python3 scraper.py --help
 """
 
 import csv
+import logging
 import re
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 from datetime import date, timedelta
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(OUTPUT_DIR / "scraper.log", mode="a", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("scraper")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 PDF_URL_TEMPLATE = "https://www.mdcourts.gov/data/case/file{date}.pdf"
-OUTPUT_DIR = Path("output")
 
 # User-agent that works with the Cloudflare-protected site
 HEADERS = {
@@ -133,14 +154,30 @@ def build_url(report_date: date) -> str:
     return PDF_URL_TEMPLATE.format(date=report_date.strftime("%Y-%m-%d"))
 
 
-def download_pdf(report_date: date, dest: Path) -> Path:
+def download_pdf(report_date: date, dest: Path, max_retries: int = 3) -> Path:
     url = build_url(report_date)
-    print(f"Downloading: {url}", file=sys.stderr)
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req) as resp:
-        dest.write_bytes(resp.read())
-    print(f"Saved to: {dest} ({dest.stat().st_size:,} bytes)", file=sys.stderr)
-    return dest
+    logger.info("Downloading: %s", url)
+    for attempt in range(1, max_retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                dest.write_bytes(resp.read())
+            logger.info("Saved %s (%s bytes)", dest, f"{dest.stat().st_size:,}")
+            return dest
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise FileNotFoundError(f"Report not available for {report_date} (404)") from exc
+            if attempt == max_retries:
+                raise
+            wait = 2 ** attempt
+            logger.warning("Attempt %d/%d failed: %s — retrying in %ds", attempt, max_retries, exc, wait)
+            time.sleep(wait)
+        except Exception as exc:
+            if attempt == max_retries:
+                raise
+            wait = 2 ** attempt
+            logger.warning("Attempt %d/%d failed: %s — retrying in %ds", attempt, max_retries, exc, wait)
+            time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +241,6 @@ def parse_case_header(line: str):
     middle = stripped[cn_match.end() : date_match.start()].rstrip()
 
     # Split middle on the last run of 3+ spaces to get name and case_type
-    # e.g. "MORGAN, ELIJAH PAUL                     Citation - Traffic        "
     parts = re.split(r"\s{3,}", middle)
     parts = [p.strip() for p in parts if p.strip()]
 
@@ -224,7 +260,6 @@ def parse_name(raw: str):
     """
     Split 'LAST, FIRST MIDDLE' into (last, first_middle).
     Returns (last_name, first_name) where first_name may include middle.
-    Handles suffixes like Jr., Sr., III appended after the first name.
     """
     raw = raw.strip()
     if "," in raw:
@@ -236,15 +271,12 @@ def parse_name(raw: str):
 def process_address_lines(lines: list[str]) -> dict:
     """
     Given the raw text lines collected from the indented address block
-    (name already stripped by caller), parse into street / city / state / zip.
-
-    Lines order: [name_line(s)..., street_line, city_state_zip]
+    parse into street / city / state / zip.
     """
     result = {"address_street": "", "address_city": "", "address_state": "", "address_zip": ""}
     if not lines:
         return result
 
-    # Find the city/state/zip line from the bottom
     csz_idx = None
     for i in range(len(lines) - 1, -1, -1):
         m = CITY_STATE_ZIP_RE.match(lines[i])
@@ -256,10 +288,8 @@ def process_address_lines(lines: list[str]) -> dict:
             break
 
     if csz_idx is None:
-        # Can't parse — return whatever we have
         return result
 
-    # Line immediately before city/state/zip is the street
     if csz_idx > 0:
         result["address_street"] = lines[csz_idx - 1].strip()
 
@@ -272,17 +302,7 @@ def process_address_lines(lines: list[str]) -> dict:
 
 
 def _extract_civil_def(line: str, civil_def_col: int) -> str:
-    """
-    Extract the defendant (right-column) text from a civil two-column address line.
-
-    Strategy:
-    1. If there is a run of 3+ spaces in the visible portion, split on the LAST
-       such gap and return the rightmost chunk.  This handles the common case where
-       plaintiff and defendant columns are clearly separated.
-    2. If no 3+ gap exists (plaintiff text runs right up against defendant text),
-       fall back to the known column position.  If that position falls mid-word,
-       walk backwards to the nearest word boundary so we return the whole word.
-    """
+    """Extract the defendant (right-column) text from a civil two-column address line."""
     visible = line.strip()
     if not visible:
         return ""
@@ -296,13 +316,9 @@ def _extract_civil_def(line: str, civil_def_col: int) -> str:
     if len(line) <= civil_def_col:
         return ""
     col = civil_def_col
-    # If we landed mid-word, walk back to the preceding space
     while col > 0 and line[col - 1] not in (" ", "\t"):
         col -= 1
     result = line[col:].strip()
-    # Sanity check: if the result looks like it's just the tail of plaintiff data
-    # (i.e. nothing was in the defendant column), return empty.
-    # A valid defendant chunk should be at least 3 chars.
     return result if len(result) >= 3 else ""
 
 
@@ -317,8 +333,8 @@ def parse_cases(text: str) -> list[dict]:
     current_county = ""
     current_case = None
     address_lines = []
-    civil_def_col = 0   # column where defendant data starts in two-column civil layout
-    state = "SCAN"  # SCAN | IN_CASE | IN_ADDRESS | IN_CIVIL_ADDRESS | IN_CHARGES
+    civil_def_col = 0
+    state = "SCAN"
 
     def finalize_case():
         nonlocal current_case, address_lines
@@ -336,45 +352,35 @@ def parse_cases(text: str) -> list[dict]:
 
         stripped = line.strip()
 
-        # ---- Address label(s) ----
         if "Defendant Address:" in line:
             if "Plaintiff Address:" in line:
-                # Civil two-column layout: Plaintiff Address:   Defendant Address:
-                # Record where the defendant column starts so we can slice each data line.
                 civil_def_col = line.index("Defendant Address:")
                 state = "IN_CIVIL_ADDRESS"
             else:
-                # Criminal / Citation: single indented defendant address block
                 state = "IN_ADDRESS"
             address_lines = []
             continue
 
-        # ---- Charges label ----
         if stripped == "Charges:":
             state = "IN_CHARGES"
             continue
 
-        # ---- Charge line ----
         charge_match = CHARGE_RE.match(stripped)
         if state == "IN_CHARGES" and charge_match:
             if current_case is not None:
                 current_case["charges"].append(charge_match.group(1).strip())
             continue
 
-        # ---- Single-column (criminal/citation) address lines ----
         if state == "IN_ADDRESS" and line.startswith(" ") and stripped:
             address_lines.append(stripped)
             continue
 
-        # ---- Two-column (civil) address lines ----
-        # Extract only the defendant (right-column) portion of each line.
         if state == "IN_CIVIL_ADDRESS" and line.startswith(" ") and stripped:
             def_part = _extract_civil_def(line, civil_def_col)
             if def_part:
                 address_lines.append(def_part)
             continue
 
-        # ---- Case header line (must start at column 0) ----
         parsed = parse_case_header(line) if not line.startswith(" ") else None
         if parsed:
             finalize_case()
@@ -398,10 +404,7 @@ def parse_cases(text: str) -> list[dict]:
             state = "IN_CASE"
             continue
 
-        # ---- County / court location header ----
-        # A non-indented, non-case-number line that isn't blank or a header
         if not line.startswith(" ") and stripped:
-            # Reject lines that look like partial charge continuations
             if not CHARGE_RE.match(stripped) and not DATE_AT_END_RE.search(stripped):
                 current_county = stripped
                 state = "SCAN"
@@ -416,19 +419,9 @@ def parse_cases(text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = [
-    "case_number",
-    "file_date",
-    "county",
-    "court_location",
-    "last_name",
-    "first_name",
-    "defendant_name",
-    "case_type",
-    "address_street",
-    "address_city",
-    "address_state",
-    "address_zip",
-    "charges",
+    "case_number", "file_date", "county", "court_location",
+    "last_name", "first_name", "defendant_name", "case_type",
+    "address_street", "address_city", "address_state", "address_zip", "charges",
 ]
 
 
@@ -440,7 +433,47 @@ def records_to_csv(records: list[dict], output_path: Path):
             row = dict(rec)
             row["charges"] = " | ".join(rec.get("charges", []))
             writer.writerow(row)
-    print(f"Wrote {len(records):,} records to {output_path}", file=sys.stderr)
+    logger.info("Wrote %d records to %s", len(records), output_path)
+
+
+# ---------------------------------------------------------------------------
+# Single-date processing
+# ---------------------------------------------------------------------------
+
+
+def process_date(report_date: date) -> int:
+    """Download, parse, and store cases for a single date. Returns record count."""
+    date_str = report_date.strftime("%Y-%m-%d")
+    pdf_path = OUTPUT_DIR / f"cases-{date_str}.pdf"
+    csv_path = OUTPUT_DIR / f"cases-{date_str}.csv"
+
+    if not pdf_path.exists():
+        try:
+            download_pdf(report_date, pdf_path)
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            logger.error("Download failed for %s: %s", date_str, e)
+            return 0
+    else:
+        logger.info("Using cached PDF: %s", pdf_path)
+
+    logger.info("Extracting text from PDF...")
+    text = pdf_to_text(pdf_path)
+
+    logger.info("Parsing cases...")
+    records = parse_cases(text)
+    logger.info("Parsed %d cases for %s", len(records), date_str)
+
+    records_to_csv(records, csv_path)
+
+    import db as _db
+    conn = _db.get_conn()
+    _db.init_db(conn)
+    _db.upsert_records(conn, records)
+    conn.close()
+    logger.info("Upserted %d records into %s", len(records), _db.DB_PATH)
+    return len(records)
 
 
 # ---------------------------------------------------------------------------
@@ -453,53 +486,56 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    # Determine target date
-    if len(sys.argv) > 1:
+    # --backfill N: fetch the last N days
+    if "--backfill" in sys.argv:
+        try:
+            idx = sys.argv.index("--backfill")
+            n_days = int(sys.argv[idx + 1])
+        except (IndexError, ValueError):
+            logger.error("Usage: scraper.py --backfill <N_DAYS>")
+            sys.exit(1)
+
+        import db as _db
+        try:
+            _conn = _db.get_conn(read_only=True)
+            existing = set(_db.available_dates(_conn))
+            _conn.close()
+        except Exception:
+            existing = set()
+
+        logger.info("Backfilling %d days (%d already in DB)...", n_days, len(existing))
+        total = 0
+        skipped = 0
+        for i in range(1, n_days + 1):
+            d = date.today() - timedelta(days=i)
+            date_str = d.strftime("%Y-%m-%d")
+            if date_str in existing:
+                logger.info("Skip %s — already in database", date_str)
+                skipped += 1
+                continue
+            logger.info("--- %s (%d/%d) ---", d, i, n_days)
+            try:
+                total += process_date(d)
+            except FileNotFoundError as e:
+                logger.info("Stopping backfill — %s", e)
+                break
+        logger.info("Backfill complete: %d new records, %d days skipped", total, skipped)
+        return
+
+    # Single date
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
         try:
             report_date = date.fromisoformat(sys.argv[1])
         except ValueError:
-            print(f"Error: invalid date '{sys.argv[1]}' — use YYYY-MM-DD", file=sys.stderr)
+            logger.error("Invalid date '%s' — use YYYY-MM-DD", sys.argv[1])
             sys.exit(1)
     else:
-        # The PDF posted today contains yesterday's cases
         report_date = date.today()
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
-    date_str = report_date.strftime("%Y-%m-%d")
-    pdf_path = OUTPUT_DIR / f"cases-{date_str}.pdf"
-    csv_path = OUTPUT_DIR / f"cases-{date_str}.csv"
-
-    # Download (skip if already on disk)
-    if not pdf_path.exists():
-        try:
-            download_pdf(report_date, pdf_path)
-        except Exception as e:
-            print(f"Download failed: {e}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        print(f"Using cached PDF: {pdf_path}", file=sys.stderr)
-
-    # Parse
-    print("Extracting text from PDF...", file=sys.stderr)
-    text = pdf_to_text(pdf_path)
-
-    print("Parsing cases...", file=sys.stderr)
-    records = parse_cases(text)
-    print(f"Parsed {len(records):,} cases", file=sys.stderr)
-
-    # Export to CSV (archival backup)
-    records_to_csv(records, csv_path)
-
-    # Upsert into DuckDB
-    import db as _db
-    conn = _db.get_conn()
-    _db.init_db(conn)
-    _db.upsert_records(conn, records)
-    conn.close()
-    print(f"Upserted {len(records):,} records into {_db.DB_PATH}", file=sys.stderr)
-
-    print(f"Done: {csv_path}")
+    count = process_date(report_date)
+    if count == 0:
+        sys.exit(1)
+    print(f"Done: output/cases-{report_date}.csv ({count:,} records)")
 
 
 if __name__ == "__main__":

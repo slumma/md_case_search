@@ -4,6 +4,7 @@ Database module for MD Case Scraper.
 All DuckDB interactions go through this module.
 """
 
+import uuid
 from pathlib import Path
 
 import duckdb
@@ -52,7 +53,7 @@ def init_db(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
-    # Add validation columns to existing DBs that predate this schema change
+    # Add columns to existing DBs that predate schema changes
     for col, typedef in [
         ("addr_validated",        "BOOLEAN DEFAULT FALSE"),
         ("addr_verdict",          "TEXT DEFAULT ''"),
@@ -61,6 +62,7 @@ def init_db(conn: duckdb.DuckDBPyConnection) -> None:
         ("addr_corrected_state",  "TEXT DEFAULT ''"),
         ("addr_corrected_zip",    "TEXT DEFAULT ''"),
         ("addr_validated_at",     "TIMESTAMPTZ DEFAULT NULL"),
+        ("source_state",          "TEXT DEFAULT 'MD'"),
     ]:
         try:
             conn.execute(f"ALTER TABLE cases ADD COLUMN {col} {typedef}")
@@ -77,15 +79,35 @@ def init_db(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lead_exports (
+            id            INTEGER PRIMARY KEY,
+            exported_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            client_label  TEXT NOT NULL DEFAULT '',
+            case_number   TEXT NOT NULL,
+            file_date     DATE NOT NULL,
+            source_state  TEXT NOT NULL DEFAULT 'MD',
+            export_batch  TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
     # Indexes for common lookup patterns
     for ddl in [
-        "CREATE INDEX IF NOT EXISTS idx_cases_last_name   ON cases(last_name)",
-        "CREATE INDEX IF NOT EXISTS idx_cases_file_date   ON cases(file_date)",
-        "CREATE INDEX IF NOT EXISTS idx_cases_county      ON cases(county)",
-        "CREATE INDEX IF NOT EXISTS idx_cases_case_type   ON cases(case_type)",
-        "CREATE INDEX IF NOT EXISTS idx_charges_text      ON case_charges(charge_text)",
+        "CREATE INDEX IF NOT EXISTS idx_cases_last_name    ON cases(last_name)",
+        "CREATE INDEX IF NOT EXISTS idx_cases_file_date    ON cases(file_date)",
+        "CREATE INDEX IF NOT EXISTS idx_cases_county       ON cases(county)",
+        "CREATE INDEX IF NOT EXISTS idx_cases_case_type    ON cases(case_type)",
+        "CREATE INDEX IF NOT EXISTS idx_charges_text       ON case_charges(charge_text)",
+        "CREATE INDEX IF NOT EXISTS idx_exports_batch      ON lead_exports(export_batch)",
+        "CREATE INDEX IF NOT EXISTS idx_exports_case       ON lead_exports(case_number, file_date)",
     ]:
         conn.execute(ddl)
+
+    # source_state index — only possible after the migration column has been added
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_source_state ON cases(source_state)")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +151,7 @@ def upsert_records(conn: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
             rec.get("address_state", ""),
             rec.get("address_zip", ""),
             charges_flat,
+            rec.get("source_state", "MD"),
         ))
 
         for seq, charge in enumerate(charges_list, start=1):
@@ -156,8 +179,8 @@ def upsert_records(conn: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
                 case_number, file_date, county, court_location,
                 last_name, first_name, defendant_name, case_type,
                 address_street, address_city, address_state, address_zip,
-                charges_flat, scraped_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+                charges_flat, scraped_at, source_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)
             ON CONFLICT (case_number, file_date) DO UPDATE SET
                 county         = excluded.county,
                 court_location = excluded.court_location,
@@ -170,6 +193,7 @@ def upsert_records(conn: duckdb.DuckDBPyConnection, records: list[dict]) -> int:
                 address_state  = excluded.address_state,
                 address_zip    = excluded.address_zip,
                 charges_flat   = excluded.charges_flat,
+                source_state   = excluded.source_state,
                 scraped_at     = now()
         """, case_rows)
 
@@ -287,3 +311,133 @@ def query_trends(conn: duckdb.DuckDBPyConnection) -> dict[str, pd.DataFrame]:
         "repeat_offenders": repeat_offenders,
         "top_charges": top_charges,
     }
+
+
+# ---------------------------------------------------------------------------
+# Leads
+# ---------------------------------------------------------------------------
+
+def query_leads(
+    conn: duckdb.DuckDBPyConnection,
+    state: str = "MD",
+    county: str = "",
+    case_type: str = "",
+    charge_category: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    has_address: bool = False,
+    addr_validated: bool = False,
+    not_exported: bool = False,
+    limit: int = 500,
+) -> pd.DataFrame:
+    """
+    Return filtered leads from the cases table.
+    charge_category is a keyword matched against charges_flat (case-insensitive).
+    """
+    conditions = ["c.source_state = ?"]
+    params: list = [state]
+
+    if county:
+        conditions.append("c.county = ?")
+        params.append(county)
+    if case_type:
+        conditions.append("c.case_type = ?")
+        params.append(case_type)
+    if charge_category:
+        conditions.append("c.charges_flat ILIKE ?")
+        params.append(f"%{charge_category}%")
+    if date_from:
+        conditions.append("c.file_date >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("c.file_date <= ?")
+        params.append(date_to)
+    if has_address:
+        conditions.append("c.address_street != ''")
+    if addr_validated:
+        conditions.append("c.addr_validated = TRUE")
+    if not_exported:
+        conditions.append("""
+            NOT EXISTS (
+                SELECT 1 FROM lead_exports le
+                WHERE le.case_number = c.case_number AND le.file_date = c.file_date
+            )
+        """)
+
+    where = " AND ".join(conditions)
+    params.append(limit)
+
+    df = conn.execute(f"""
+        SELECT
+            c.case_number,
+            strftime(c.file_date, '%Y-%m-%d')  AS file_date,
+            c.source_state,
+            c.county,
+            c.case_type,
+            c.defendant_name,
+            c.address_street,
+            c.address_city,
+            c.address_state,
+            c.address_zip,
+            c.charges_flat,
+            c.addr_validated,
+            c.addr_verdict,
+            c.addr_corrected_street,
+            c.addr_corrected_city,
+            c.addr_corrected_state,
+            c.addr_corrected_zip,
+            COUNT(le.id) AS times_exported
+        FROM cases c
+        LEFT JOIN lead_exports le
+               ON le.case_number = c.case_number AND le.file_date = c.file_date
+        WHERE {where}
+        GROUP BY
+            c.case_number, c.file_date, c.source_state, c.county, c.case_type,
+            c.defendant_name, c.address_street, c.address_city, c.address_state,
+            c.address_zip, c.charges_flat, c.addr_validated, c.addr_verdict,
+            c.addr_corrected_street, c.addr_corrected_city,
+            c.addr_corrected_state, c.addr_corrected_zip
+        ORDER BY c.file_date DESC, c.county, c.defendant_name
+        LIMIT ?
+    """, params).df()
+
+    return df.fillna("")
+
+
+def record_export(
+    conn: duckdb.DuckDBPyConnection,
+    client_label: str,
+    records: list[dict],
+    state: str = "MD",
+) -> str:
+    """
+    Record a batch export to lead_exports. Returns the batch UUID.
+    """
+    batch_id = str(uuid.uuid4())
+    rows = [
+        (client_label, r["case_number"], r["file_date"], state, batch_id)
+        for r in records
+        if r.get("case_number") and r.get("file_date")
+    ]
+    if rows:
+        conn.executemany(
+            "INSERT INTO lead_exports (client_label, case_number, file_date, source_state, export_batch) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+    return batch_id
+
+
+def export_history(conn: duckdb.DuckDBPyConnection, limit: int = 100) -> pd.DataFrame:
+    """Return recent export batches grouped by batch ID."""
+    return conn.execute("""
+        SELECT
+            export_batch,
+            MAX(strftime(exported_at, '%Y-%m-%d %H:%M')) AS exported_at,
+            MAX(client_label)  AS client_label,
+            source_state,
+            COUNT(*)           AS lead_count
+        FROM lead_exports
+        GROUP BY export_batch, source_state
+        ORDER BY MAX(exported_at) DESC
+        LIMIT ?
+    """, [limit]).df().fillna("")

@@ -14,6 +14,7 @@ import plotly.express as px
 import streamlit as st
 
 import db
+import analytics
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -140,8 +141,8 @@ if st.sidebar.button("Download & Parse", use_container_width=True, type="primary
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_overview, tab_data, tab_analytics, tab_trends, tab_scraper = st.tabs([
-    "Overview", "Data", "Analytics", "Trends", "Run Scraper"
+tab_overview, tab_data, tab_analytics, tab_trends, tab_intel, tab_scraper = st.tabs([
+    "Overview", "Data", "Analytics", "Trends", "Intelligence", "Run Scraper"
 ])
 
 # ===========================================================================
@@ -443,7 +444,169 @@ with tab_trends:
 
 
 # ===========================================================================
-# TAB 5 — Run Scraper (detailed)
+# TAB 5 — Intelligence (statistical analysis)
+# ===========================================================================
+
+with tab_intel:
+    if len(report_dates) < 1:
+        st.info("Run the scraper for at least one day to unlock this tab.")
+    else:
+        conn_intel = db.get_conn(read_only=True)
+
+        # ── Summary stats ────────────────────────────────────────────────
+        stats = analytics.summary_stats(conn_intel)
+        st.subheader("Database Overview")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Cases", f"{stats['total_cases']:,}")
+        m2.metric("Days of Data", stats["days_of_data"])
+        m3.metric("Unique Defendants", f"{stats['unique_defendants']:,}")
+        m4.metric("Counties", stats["unique_counties"])
+        m5.metric("Addr. Validated", f"{stats['addr_validated_count']:,}")
+
+        st.divider()
+
+        # ── Charge analysis ──────────────────────────────────────────────
+        col_l, col_r = st.columns(2)
+
+        with col_l:
+            st.subheader("Charge Category Breakdown")
+            cat_df = analytics.charge_category_summary(df_raw)
+            charge_info = analytics.charge_frequency_analysis(df_raw)
+            st.caption(
+                f"{charge_info['unique_charges']:,} unique charges · "
+                f"Entropy: {charge_info['entropy']:.3f} · "
+                f"Gini: {charge_info['concentration_gini']:.3f}"
+            )
+            fig_cat = px.bar(
+                cat_df,
+                x="count",
+                y="category",
+                orientation="h",
+                labels={"count": "Count", "category": "Category"},
+                color="count",
+                color_continuous_scale="Blues",
+                height=400,
+            )
+            fig_cat.update_layout(coloraxis_showscale=False, margin=dict(l=0))
+            st.plotly_chart(fig_cat, use_container_width=True)
+
+        with col_r:
+            st.subheader("Geographic Concentration")
+            geo = analytics.geographic_concentration(df_raw)
+            st.caption(
+                f"Gini coefficient: **{geo['gini']:.3f}** "
+                f"(0 = equal across counties, 1 = all in one) · "
+                f"Top 3 counties: **{geo['top3_pct']}%** of cases"
+            )
+            if not geo["county_stats"].empty:
+                fig_geo = px.bar(
+                    geo["county_stats"].head(15),
+                    x="pct_of_total",
+                    y="county",
+                    orientation="h",
+                    text="pct_of_total",
+                    labels={"pct_of_total": "% of Cases", "county": "County"},
+                    color="pct_of_total",
+                    color_continuous_scale="Reds",
+                    height=400,
+                )
+                fig_geo.update_traces(texttemplate="%{text}%", textposition="outside")
+                fig_geo.update_layout(coloraxis_showscale=False, margin=dict(l=0))
+                st.plotly_chart(fig_geo, use_container_width=True)
+
+        st.divider()
+
+        # ── County trends (Mann-Kendall) ─────────────────────────────────
+        st.subheader("County Trend Analysis (Mann-Kendall Test)")
+        st.caption(
+            "Statistically tests whether each county's daily case volume is "
+            "trending up or down over the available date range. p < 0.05 = significant."
+        )
+        trend_df = analytics.county_trend_analysis(conn_intel, top_n=15)
+        if trend_df.empty:
+            st.info("Need data from 4+ dates for trend analysis.")
+        else:
+            # Color-code trend column
+            def color_trend(val):
+                if val == "increasing":
+                    return "color: #EF4444"
+                if val == "decreasing":
+                    return "color: #22C55E"
+                return ""
+
+            st.dataframe(
+                trend_df.style.map(color_trend, subset=["trend"]),
+                use_container_width=True,
+                hide_index=True,
+                height=420,
+                column_config={
+                    "county":       st.column_config.TextColumn("County"),
+                    "total_cases":  st.column_config.NumberColumn("Total Cases", format="%d"),
+                    "avg_daily":    st.column_config.NumberColumn("Avg/Day", format="%.1f"),
+                    "trend":        st.column_config.TextColumn("Trend"),
+                    "p_value":      st.column_config.NumberColumn("p-value", format="%.4f"),
+                    "days_of_data": st.column_config.NumberColumn("Days"),
+                },
+            )
+
+        st.divider()
+
+        # ── Repeat offenders ────────────────────────────────────────────
+        st.subheader("Repeat Offender Analysis")
+        repeat_result = analytics.repeat_offender_analysis(conn_intel)
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Repeat Offenders", f"{repeat_result['count']:,}")
+        r2.metric("Max Appearances", repeat_result["max_appearances"])
+        r3.metric("Multi-County", f"{repeat_result['multi_county']:,}")
+
+        if not repeat_result["repeat_offenders"].empty:
+            ro_df = repeat_result["repeat_offenders"]
+            st.dataframe(
+                ro_df[["defendant_name", "filing_days", "total_cases",
+                        "first_seen", "last_seen", "case_types", "counties"]].rename(columns={
+                    "defendant_name": "Defendant",
+                    "filing_days":    "Days Filed",
+                    "total_cases":    "Total Cases",
+                    "first_seen":     "First Seen",
+                    "last_seen":      "Last Seen",
+                    "case_types":     "Case Types",
+                    "counties":       "Counties",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                height=350,
+            )
+
+        st.divider()
+
+        # ── ML Export ────────────────────────────────────────────────────
+        st.subheader("Export for ML Workflows")
+        st.caption("Exports to Parquet — columnar format ideal for pandas, polars, DuckDB, sklearn, XGBoost.")
+        ex1, ex2, ex3 = st.columns(3)
+
+        with ex1:
+            if st.button("Export Cases (Parquet)", use_container_width=True):
+                import exports
+                path = exports.export_cases()
+                st.success(f"Saved: {path}")
+
+        with ex2:
+            if st.button("Export Charges (Parquet)", use_container_width=True):
+                import exports
+                path = exports.export_charges()
+                st.success(f"Saved: {path}")
+
+        with ex3:
+            if st.button("Export Feature Matrix (Parquet)", use_container_width=True):
+                import exports
+                path = exports.export_features()
+                st.success(f"Saved: {path}")
+
+        conn_intel.close()
+
+
+# ===========================================================================
+# TAB 6 — Run Scraper (detailed)
 # ===========================================================================
 
 with tab_scraper:
@@ -488,6 +651,29 @@ with tab_scraper:
             st.code(result.stderr, language=None)
             if result.stdout:
                 st.code(result.stdout, language=None)
+
+    st.divider()
+    st.subheader("Backfill Historical Data")
+    st.write("Download and parse multiple past days in one shot.")
+    backfill_days = st.slider("Days to backfill", min_value=1, max_value=90, value=7)
+    if st.button("Run Backfill", type="secondary"):
+        with st.spinner(f"Backfilling {backfill_days} days..."):
+            result = subprocess.run(
+                [sys.executable, "scraper.py", "--backfill", str(backfill_days)],
+                capture_output=True,
+                text=True,
+                cwd=Path(__file__).parent,
+            )
+        if result.returncode == 0:
+            st.success(f"Backfill complete.")
+            st.code(result.stderr[-3000:] if len(result.stderr) > 3000 else result.stderr, language=None)
+            get_available_dates.clear()
+            load_date.clear()
+            load_trends.clear()
+            st.rerun()
+        else:
+            st.error("Backfill failed.")
+            st.code(result.stderr, language=None)
 
     st.divider()
     st.subheader("Database Summary")
